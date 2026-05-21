@@ -39,7 +39,7 @@ APT 源启用 `contrib` 组件。
 3. 点击 `Run workflow`。
 4. 选择 Debian 镜像：`bookworm`、`trixie` 或 `bullseye`。
 5. `architectures` 默认是 `amd64 arm64`，会生成和现有 Release 一致的双架构包。
-6. `kernels` 默认填 `all`，表示构建当前 Debian 镜像中 APT 源可见的全部内核版本。
+6. `kernels` 默认填 `all`，表示构建当前 Debian 镜像中 APT 源可见的目标内核版本。
 7. `skip_existing_release` 默认开启，会自动跳过 `release_tag` 中已经存在的同名产物。
 
 ```text
@@ -65,9 +65,11 @@ APT 源启用 `contrib` 组件。
 
 - GitHub Actions 使用 `ubuntu-latest` 作为宿主机，但实际构建在 Debian Docker
   容器中完成。
-- `all` 会扫描 Debian APT 源中可见的所有实际内核 header 版本；已存在于 Release
-  的同名产物会在安装编译依赖前跳过。
+- `all` 会扫描 Debian APT 源中可见的实际内核 header 版本，但只保留普通架构 flavor
+  和 cloud flavor：`amd64` / `cloud-amd64`，以及 `arm64` / `cloud-arm64`。`rt` 等非目标
+  flavor 会被过滤；已存在于 Release 的同名产物会在安装编译依赖前跳过。
 - Release 资产命名保持为 `zfs-modules-<完整内核版本>.tar.gz`，例如
   `zfs-modules-6.12.74+deb13+1-cloud-arm64.tar.gz`。
 - ZFS DKMS 模块必须和目标内核版本、架构、ZFS 版本匹配。
-- Release 资产会被同名覆盖，便于重复运行 workflow 更新产物。
+- 默认开启 `skip_existing_release` 时，已有同名 Release 资产不会重复上传；如果关闭跳过或
+  手动放入同名产物，发布步骤会覆盖同名资产。

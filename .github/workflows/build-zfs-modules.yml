@@ -13,7 +13,7 @@ on:
           - trixie
           - bullseye
       kernels:
-        description: Kernel versions separated by spaces or commas, or "all"
+        description: Kernel versions separated by spaces or commas, or "all" for regular/cloud flavors
         required: true
         type: string
         default: all

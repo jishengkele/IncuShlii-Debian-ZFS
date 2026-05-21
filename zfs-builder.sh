@@ -55,6 +55,43 @@ package_in_skip_list() {
     grep -Fxq -- "$package_file" "$SKIP_PACKAGES_FILE"
 }
 
+supported_kernel_flavors() {
+    case "$ARCH" in
+        amd64|arm64)
+            printf "%s, cloud-%s" "$ARCH" "$ARCH"
+            ;;
+        *)
+            printf "%s" "$ARCH"
+            ;;
+    esac
+}
+
+is_supported_kernel_version() {
+    local kver="$1"
+    local stem tail
+
+    case "$ARCH" in
+        amd64|arm64)
+            if [[ "$kver" == *"-cloud-${ARCH}" ]]; then
+                return 0
+            fi
+
+            [[ "$kver" == *"-${ARCH}" ]] || return 1
+
+            stem="${kver%-${ARCH}}"
+            if [[ "$stem" != *"-"* ]]; then
+                return 0
+            fi
+
+            tail="${stem##*-}"
+            [[ "$tail" =~ ^[0-9]+$ ]]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # ========================== 显示横幅 ==========================
 show_banner() {
     clear 2>/dev/null || true
@@ -127,10 +164,12 @@ show_system_info() {
 # ========================== 获取可用内核列表 ==========================
 refresh_kernel_list() {
     info "查询可用的内核版本..."
+    info "仅保留内核 flavor: $(supported_kernel_flavors)"
     apt-get update -qq 2>/dev/null
 
     KERNEL_LIST=()
     local headers
+    local ignored=0
     headers=$(apt-cache search --names-only '^linux-headers-[0-9]' 2>/dev/null \
         | awk '{print $1}' \
         | sed 's/^linux-headers-//' \
@@ -139,10 +178,17 @@ refresh_kernel_list() {
 
     while IFS= read -r kver; do
         [[ -z "$kver" ]] && continue
-        KERNEL_LIST+=("$kver")
+        if is_supported_kernel_version "$kver"; then
+            KERNEL_LIST+=("$kver")
+        else
+            ignored=$((ignored + 1))
+        fi
     done <<< "$headers"
 
     log "找到 ${#KERNEL_LIST[@]} 个可用内核版本"
+    if [[ "$ignored" -gt 0 ]]; then
+        info "已过滤 ${ignored} 个非目标内核 flavor"
+    fi
 }
 
 # ========================== 显示内核版本列表 ==========================
