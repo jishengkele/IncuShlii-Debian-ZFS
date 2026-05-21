@@ -90,6 +90,8 @@ jobs:
           set -euo pipefail
 
           mkdir -p output .github-tmp
+          echo "Workflow SHA: ${GITHUB_SHA}"
+          echo "Checked out commit: $(git rev-parse --short HEAD)"
 
           if [[ "${SKIP_EXISTING_RELEASE}" == "true" ]]; then
             cp .github-tmp/release-assets.txt .github-tmp/skip-assets.txt

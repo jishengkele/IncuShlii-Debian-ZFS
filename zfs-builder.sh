@@ -55,6 +55,45 @@ package_in_skip_list() {
     grep -Fxq -- "$package_file" "$SKIP_PACKAGES_FILE"
 }
 
+run_logged() {
+    local description="$1"
+    shift
+
+    local log_file
+    log_file=$(mktemp /tmp/zfs-build.XXXXXX.log)
+
+    if "$@" >"$log_file" 2>&1; then
+        rm -f "$log_file"
+        return 0
+    fi
+
+    local rc=$?
+    error "${description} 失败"
+    if [[ -s "$log_file" ]]; then
+        echo -e "${DIM}  ---- ${description} 输出开始 ----${NC}"
+        tail -n 80 "$log_file"
+        echo -e "${DIM}  ---- ${description} 输出结束 ----${NC}"
+    fi
+    rm -f "$log_file"
+    return "$rc"
+}
+
+print_dkms_make_log() {
+    local zfs_ver="$1"
+    local kernel_ver="$2"
+    local log_file
+
+    log_file=$(find "/var/lib/dkms/zfs/${zfs_ver}" -type f -name make.log 2>/dev/null \
+        | grep -F "/${kernel_ver}/" \
+        | head -n1 || true)
+
+    [[ -n "$log_file" && -f "$log_file" ]] || return 0
+
+    echo -e "${DIM}  ---- DKMS make.log: ${log_file} ----${NC}"
+    tail -n 120 "$log_file"
+    echo -e "${DIM}  ---- DKMS make.log 结束 ----${NC}"
+}
+
 supported_kernel_flavors() {
     case "$ARCH" in
         amd64|arm64)
@@ -366,12 +405,14 @@ install_build_base() {
     fi
 
     # 安装编译工具链
-    apt-get install -y -qq build-essential dkms >/dev/null 2>&1
+    if ! run_logged "安装 build-essential 和 dkms" apt-get install -y -qq build-essential dkms; then
+        return 1
+    fi
     log "编译工具链就绪"
 
     # 安装 ZFS DKMS 源码
     info "安装 ZFS DKMS 源码包..."
-    if ! apt-get install -y -qq zfs-dkms >/dev/null 2>&1; then
+    if ! run_logged "安装 zfs-dkms" apt-get install -y -qq zfs-dkms; then
         error "zfs-dkms 安装失败，请确认 Debian contrib 源可用"
         return 1
     fi
@@ -407,8 +448,12 @@ build_for_kernel() {
 
     # 安装对应的内核头文件
     info "安装 linux-headers-${kernel_ver}..."
-    if ! apt-get install -y -qq "linux-headers-${kernel_ver}" >/dev/null 2>&1; then
-        error "linux-headers-${kernel_ver} 安装失败"
+    if ! run_logged "安装 linux-headers-${kernel_ver}" apt-get install -y -qq "linux-headers-${kernel_ver}"; then
+        local header_zfs_ver
+        header_zfs_ver=$(get_zfs_dkms_version || true)
+        if [[ -n "$header_zfs_ver" ]]; then
+            print_dkms_make_log "$header_zfs_ver" "$kernel_ver"
+        fi
         return 1
     fi
 
@@ -425,12 +470,12 @@ build_for_kernel() {
     local start_time=$SECONDS
 
     dkms remove "zfs/${zfs_ver}" -k "$kernel_ver" 2>/dev/null || true
-    if ! dkms build "zfs/${zfs_ver}" -k "$kernel_ver" 2>/dev/null; then
-        error "DKMS build 失败"
+    if ! run_logged "DKMS build zfs/${zfs_ver} for ${kernel_ver}" dkms build "zfs/${zfs_ver}" -k "$kernel_ver"; then
+        print_dkms_make_log "$zfs_ver" "$kernel_ver"
         return 1
     fi
-    if ! dkms install "zfs/${zfs_ver}" -k "$kernel_ver" 2>/dev/null; then
-        error "DKMS install 失败"
+    if ! run_logged "DKMS install zfs/${zfs_ver} for ${kernel_ver}" dkms install "zfs/${zfs_ver}" -k "$kernel_ver"; then
+        print_dkms_make_log "$zfs_ver" "$kernel_ver"
         return 1
     fi
 
