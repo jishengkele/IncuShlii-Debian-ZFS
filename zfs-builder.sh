@@ -27,6 +27,9 @@ OUTPUT_DIR="$(pwd)/output"
 KERNEL_LIST=()         # 可用内核版本缓存
 TARGET_KERNELS=()      # 选中要编译的内核版本
 CLI_MODE=""            # 命令行模式（空 = 交互式）
+ASSUME_YES=false       # 非交互模式自动确认
+FAIL_ON_ERROR=false    # 有失败时以非零状态退出，适合 CI 使用
+SKIP_PACKAGES_FILE="${SKIP_PACKAGES_FILE:-}"  # 已有 Release 资产名列表，每行一个文件名
 
 # ========================== 工具函数 ==========================
 log()   { echo -e "${GREEN}[✓]${NC} $1"; }
@@ -37,6 +40,19 @@ step()  { echo -e "\n${CYAN}[▶]${NC} ${BOLD}$1${NC}"; }
 
 divider() {
     echo -e "${DIM}────────────────────────────────────────────────────${NC}"
+}
+
+get_zfs_dkms_version() {
+    dkms status 2>/dev/null \
+        | awk -F'[/, ]+' '$1 == "zfs" { for (i = 2; i <= NF; i++) if ($i ~ /^[0-9][0-9A-Za-z.+:~_-]*$/) { print $i; exit } }' \
+        | head -n1
+}
+
+package_in_skip_list() {
+    local package_file="$1"
+
+    [[ -n "$SKIP_PACKAGES_FILE" && -f "$SKIP_PACKAGES_FILE" ]] || return 1
+    grep -Fxq -- "$package_file" "$SKIP_PACKAGES_FILE"
 }
 
 # ========================== 显示横幅 ==========================
@@ -115,10 +131,11 @@ refresh_kernel_list() {
 
     KERNEL_LIST=()
     local headers
-    headers=$(apt-cache search '^linux-headers-[0-9]' 2>/dev/null \
+    headers=$(apt-cache search --names-only '^linux-headers-[0-9]' 2>/dev/null \
         | awk '{print $1}' \
         | sed 's/^linux-headers-//' \
-        | sort -V)
+        | grep -Ev '(^|-)common($|-)|-dbg$|-dbgsym$|-all(-|$)' \
+        | sort -V || true)
 
     while IFS= read -r kver; do
         [[ -z "$kver" ]] && continue
@@ -293,7 +310,7 @@ install_build_base() {
     if [[ "$contrib_enabled" == "false" ]]; then
         info "启用 contrib 组件..."
         if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
-            sed -i 's/Components: main$/Components: main contrib/' \
+            sed -i -E '/^Components:/ { /(^| )contrib( |$)/! s/$/ contrib/ }' \
                 /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
         elif [[ -f /etc/apt/sources.list ]]; then
             sed -i '/^deb.*main/ { /contrib/! s/main/main contrib/ }' \
@@ -308,12 +325,14 @@ install_build_base() {
 
     # 安装 ZFS DKMS 源码
     info "安装 ZFS DKMS 源码包..."
-    apt-get install -y -qq zfs-dkms >/dev/null 2>&1 || {
-        apt-get install -y -qq zfsutils-linux >/dev/null 2>&1 || true
-    }
+    if ! apt-get install -y -qq zfs-dkms >/dev/null 2>&1; then
+        error "zfs-dkms 安装失败，请确认 Debian contrib 源可用"
+        return 1
+    fi
 
     local zfs_ver
-    zfs_ver=$(dkms status 2>/dev/null | grep -oP 'zfs[/,]\s*\K[0-9.]+' | head -n1 || echo "?")
+    zfs_ver=$(get_zfs_dkms_version || true)
+    zfs_ver=${zfs_ver:-?}
     log "ZFS DKMS 源码版本: ${zfs_ver}"
 }
 
@@ -322,6 +341,8 @@ build_for_kernel() {
     local kernel_ver="$1"
     local index="$2"
     local total="$3"
+    local package_name="zfs-modules-${kernel_ver}"
+    local package_file="${package_name}.tar.gz"
 
     echo ""
     divider
@@ -329,9 +350,13 @@ build_for_kernel() {
     divider
 
     # 检查是否已有包
-    if [[ -f "${OUTPUT_DIR}/zfs-modules-${kernel_ver}.tar.gz" ]]; then
+    if [[ -f "${OUTPUT_DIR}/${package_file}" ]]; then
         info "已存在预编译包，跳过（如需重新编译请先删除旧包）"
-        return 0
+        return 2
+    fi
+    if package_in_skip_list "$package_file"; then
+        info "Release 中已存在 ${package_file}，跳过"
+        return 2
     fi
 
     # 安装对应的内核头文件
@@ -343,7 +368,7 @@ build_for_kernel() {
 
     # 获取 ZFS DKMS 版本号
     local zfs_ver
-    zfs_ver=$(dkms status 2>/dev/null | grep -oP 'zfs[/,]\s*\K[0-9.]+' | head -n1)
+    zfs_ver=$(get_zfs_dkms_version || true)
     if [[ -z "$zfs_ver" ]]; then
         error "无法获取 ZFS DKMS 版本号"
         return 1
@@ -387,10 +412,9 @@ build_for_kernel() {
     fi
 
     # 打包
-    local package_name="zfs-modules-${kernel_ver}"
-    local pack_tmp="/tmp/zfs-pack-$$"
+    local pack_tmp
+    pack_tmp=$(mktemp -d /tmp/zfs-pack.XXXXXX)
     local pack_dir="${pack_tmp}/${package_name}"
-    rm -rf "$pack_tmp" 2>/dev/null || true
     mkdir -p "${pack_dir}/modules"
 
     find "$found_dir" -name "*.ko*" -type f -exec cp {} "${pack_dir}/modules/" \;
@@ -430,6 +454,10 @@ META
 # ========================== 执行编译 ==========================
 do_build() {
     local total=${#TARGET_KERNELS[@]}
+    local -a build_targets=()
+    local success=0
+    local skipped=0
+    local failed=0
 
     # 显示编译计划
     echo ""
@@ -437,36 +465,55 @@ do_build() {
     echo -e "  ${BOLD}编译计划（共 ${total} 个内核版本）${NC}"
     divider
     for kver in "${TARGET_KERNELS[@]}"; do
-        if [[ -f "${OUTPUT_DIR}/zfs-modules-${kver}.tar.gz" ]]; then
-            echo -e "    ${YELLOW}•${NC}  ${kver}  ${DIM}(已有包，将跳过)${NC}"
+        local package_file="zfs-modules-${kver}.tar.gz"
+        if [[ -f "${OUTPUT_DIR}/${package_file}" ]]; then
+            echo -e "    ${YELLOW}•${NC}  ${kver}  ${DIM}(已有本地产物，将跳过)${NC}"
+            skipped=$((skipped + 1))
+        elif package_in_skip_list "$package_file"; then
+            echo -e "    ${YELLOW}•${NC}  ${kver}  ${DIM}(Release 已有，将跳过)${NC}"
+            skipped=$((skipped + 1))
         else
             echo -e "    ${CYAN}•${NC}  ${kver}"
+            build_targets+=("$kver")
         fi
     done
     divider
     echo ""
-    echo -ne "  ${BOLD}确认开始编译？${NC}[y/N]: "
-    read -r confirm
+    local confirm
+    if [[ "$ASSUME_YES" == "true" ]]; then
+        confirm="y"
+        info "已启用自动确认"
+    else
+        echo -ne "  ${BOLD}确认开始编译？${NC}[y/N]: "
+        read -r confirm || confirm=""
+    fi
     [[ "$confirm" =~ ^[yY]$ ]] || { info "已取消"; return; }
 
-    # 安装编译基础
-    install_build_base
+    if [[ ${#build_targets[@]} -eq 0 ]]; then
+        info "没有需要新编译的内核版本"
+    else
+        # 安装编译基础
+        install_build_base
 
-    # 逐个编译
-    local success=0
-    local skipped=0
-    local failed=0
-    local i=0
+        # 逐个编译
+        local i=0
+        local build_total=${#build_targets[@]}
 
-    for kernel_ver in "${TARGET_KERNELS[@]}"; do
-        i=$((i + 1))
-        if build_for_kernel "$kernel_ver" "$i" "$total"; then
-            success=$((success + 1))
-        else
-            failed=$((failed + 1))
-            warn "跳过失败的版本，继续..."
-        fi
-    done
+        for kernel_ver in "${build_targets[@]}"; do
+            i=$((i + 1))
+            if build_for_kernel "$kernel_ver" "$i" "$build_total"; then
+                success=$((success + 1))
+            else
+                local rc=$?
+                if [[ "$rc" -eq 2 ]]; then
+                    skipped=$((skipped + 1))
+                else
+                    failed=$((failed + 1))
+                    warn "跳过失败的版本，继续..."
+                fi
+            fi
+        done
+    fi
 
     # 结果
     echo ""
@@ -476,7 +523,7 @@ do_build() {
     echo -e "${GREEN}  ║                                                  ║${NC}"
     echo -e "${GREEN}  ╚══════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "  成功: ${GREEN}${success}${NC}  |  失败: ${RED}${failed}${NC}  |  总计: ${total}"
+    echo -e "  新编译: ${GREEN}${success}${NC}  |  跳过: ${YELLOW}${skipped}${NC}  |  失败: ${RED}${failed}${NC}  |  总计: ${total}"
     echo ""
 
     show_packages
@@ -485,11 +532,15 @@ do_build() {
     echo -e "  ${BOLD}后续操作：${NC}"
     echo ""
     echo -e "  1. 将 ${CYAN}output/${NC} 目录中的文件拉回本地"
-    echo -e "  2. 在 GitHub 仓库创建 Release（Tag: ${CYAN}zfs-prebuilt${NC}）"
+    echo -e "  2. 在 GitHub 仓库创建或更新 Release（Tag: ${CYAN}Debian-ZFS${NC}）"
     echo -e "  3. 将所有 .tar.gz 文件上传为 Release Assets"
     echo -e "  4. 更新 Incudal.sh 中的 ${CYAN}ZFS_PREBUILT_URL${NC} 地址"
     divider
     echo ""
+
+    if [[ "$failed" -gt 0 && "$FAIL_ON_ERROR" == "true" ]]; then
+        return 1
+    fi
 }
 
 # ========================== CLI 参数解析 ==========================
@@ -500,7 +551,17 @@ parse_args() {
                 CLI_MODE="all"; shift ;;
             --list|-l)
                 CLI_MODE="list"; shift ;;
+            --yes|-y)
+                ASSUME_YES=true; shift ;;
+            --ci)
+                ASSUME_YES=true
+                FAIL_ON_ERROR=true
+                shift ;;
             --kernel|-k)
+                if [[ $# -lt 2 || "${2:-}" == -* ]]; then
+                    error "--kernel 需要指定内核版本"
+                    exit 1
+                fi
                 CLI_MODE="specific"
                 TARGET_KERNELS+=("$2"); shift 2 ;;
             --help|-h)
@@ -511,6 +572,8 @@ parse_args() {
                 echo "  --all, -a             编译所有可用内核版本"
                 echo "  --kernel, -k <VER>    编译指定内核版本（可多次使用）"
                 echo "  --list, -l            列出可用内核版本"
+                echo "  --yes, -y             自动确认，适合 CI 使用"
+                echo "  --ci                  CI 模式：自动确认，任一目标失败则返回非零状态"
                 echo "  --help, -h            显示帮助"
                 exit 0 ;;
             *)

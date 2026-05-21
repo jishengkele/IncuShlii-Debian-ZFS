@@ -1,0 +1,169 @@
+name: Build ZFS modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      debian_image:
+        description: Debian Docker image tag
+        required: true
+        type: choice
+        default: bookworm
+        options:
+          - bookworm
+          - trixie
+          - bullseye
+      kernels:
+        description: Kernel versions separated by spaces or commas, or "all"
+        required: true
+        type: string
+        default: all
+      architectures:
+        description: Architectures separated by spaces or commas
+        required: true
+        type: string
+        default: amd64 arm64
+      publish_release:
+        description: Upload packages to the Debian-ZFS GitHub Release
+        required: true
+        type: boolean
+        default: false
+      release_tag:
+        description: Release tag used when publish_release is enabled
+        required: true
+        type: string
+        default: Debian-ZFS
+      skip_existing_release:
+        description: Skip packages whose asset names already exist in release_tag
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build on Debian ${{ inputs.debian_image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU for arm64 containers
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Read existing Release assets
+        id: release-assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p .github-tmp
+
+          if release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.id' 2>/dev/null); then
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
+              --jq '.[].name' \
+              | sort -u > .github-tmp/release-assets.txt
+          else
+            echo "Release ${RELEASE_TAG} does not exist yet; no assets will be skipped."
+            : > .github-tmp/release-assets.txt
+          fi
+
+          existing_count=$(wc -l < .github-tmp/release-assets.txt | tr -d " ")
+          echo "existing_asset_count=${existing_count}" >> "${GITHUB_OUTPUT}"
+          echo "Found ${existing_count} existing Release assets."
+
+      - name: Build packages in Debian container
+        id: build
+        env:
+          DEBIAN_IMAGE: debian:${{ inputs.debian_image }}
+          KERNELS: ${{ inputs.kernels }}
+          ARCHITECTURES: ${{ inputs.architectures }}
+          SKIP_EXISTING_RELEASE: ${{ inputs.skip_existing_release }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p output .github-tmp
+
+          if [[ "${SKIP_EXISTING_RELEASE}" == "true" ]]; then
+            cp .github-tmp/release-assets.txt .github-tmp/skip-assets.txt
+          else
+            : > .github-tmp/skip-assets.txt
+          fi
+
+          normalized_arches=$(printf "%s" "${ARCHITECTURES}" | tr "," " ")
+
+          for arch in ${normalized_arches}; do
+            case "${arch}" in
+              amd64|arm64) ;;
+              *)
+                echo "Unsupported architecture: ${arch}" >&2
+                exit 1
+                ;;
+            esac
+
+            docker pull --platform "linux/${arch}" "${DEBIAN_IMAGE}"
+            docker run --rm \
+              --platform "linux/${arch}" \
+              -e DEBIAN_FRONTEND=noninteractive \
+              -e KERNELS="${KERNELS}" \
+              -e GITHUB_RUN_ID="${GITHUB_RUN_ID}" \
+              -e SKIP_PACKAGES_FILE=/workspace/.github-tmp/skip-assets.txt \
+              -v "${GITHUB_WORKSPACE}:/workspace" \
+              -w /workspace \
+              "${DEBIAN_IMAGE}" \
+              bash -lc '
+                set -euo pipefail
+
+                if [[ "${KERNELS}" == "all" ]]; then
+                  bash zfs-builder.sh --ci --all
+                else
+                  args=(--ci)
+                  normalized=$(printf "%s" "${KERNELS}" | tr "," " ")
+                  for kernel in ${normalized}; do
+                    args+=(--kernel "${kernel}")
+                  done
+                  bash zfs-builder.sh "${args[@]}"
+                fi
+              '
+          done
+
+          built_count=$(find output -maxdepth 1 -type f -name "zfs-modules-*.tar.gz" | wc -l | tr -d " ")
+          echo "built_count=${built_count}" >> "${GITHUB_OUTPUT}"
+          echo "Built ${built_count} new package(s)."
+
+      - name: Upload workflow artifact
+        if: ${{ steps.build.outputs.built_count != '0' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: zfs-modules-${{ inputs.debian_image }}
+          path: |
+            output/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Report no new packages
+        if: ${{ steps.build.outputs.built_count == '0' }}
+        run: echo "No new packages were built; all selected targets already exist in the Release or local output."
+
+      - name: Publish GitHub Release assets
+        if: ${{ inputs.publish_release && steps.build.outputs.built_count != '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" output/*.tar.gz --clobber
+          else
+            gh release create "${RELEASE_TAG}" output/*.tar.gz \
+              --title "${RELEASE_TAG}" \
+              --notes "ZFS prebuilt modules built by GitHub Actions run ${GITHUB_RUN_ID}."
+          fi
