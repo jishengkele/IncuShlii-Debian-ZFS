@@ -62,7 +62,27 @@ run_logged() {
     local log_file
     log_file=$(mktemp /tmp/zfs-build.XXXXXX.log)
 
-    if "$@" >"$log_file" 2>&1; then
+    "$@" >"$log_file" 2>&1 &
+    local pid=$!
+    local start_time=$SECONDS
+    local next_report=60
+    local elapsed
+
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 5
+        kill -0 "$pid" 2>/dev/null || break
+
+        elapsed=$(( SECONDS - start_time ))
+        if (( elapsed >= next_report )); then
+            echo -e "${DIM}  ${description} 仍在运行，已耗时 ${elapsed} 秒...${NC}"
+            if [[ -s "$log_file" ]]; then
+                tail -n 8 "$log_file" | sed 's/^/    /'
+            fi
+            next_report=$(( next_report + 60 ))
+        fi
+    done
+
+    if wait "$pid"; then
         rm -f "$log_file"
         return 0
     fi
@@ -92,6 +112,26 @@ print_dkms_make_log() {
     echo -e "${DIM}  ---- DKMS make.log: ${log_file} ----${NC}"
     tail -n 120 "$log_file"
     echo -e "${DIM}  ---- DKMS make.log 结束 ----${NC}"
+}
+
+with_dkms_autoinstall_disabled() {
+    local flag="/etc/dkms/no-autoinstall"
+    local created=false
+    local rc=0
+
+    mkdir -p /etc/dkms
+    if [[ ! -e "$flag" ]]; then
+        : > "$flag"
+        created=true
+    fi
+
+    "$@" || rc=$?
+
+    if [[ "$created" == "true" ]]; then
+        rm -f "$flag"
+    fi
+
+    return "$rc"
 }
 
 supported_kernel_flavors() {
@@ -448,7 +488,7 @@ build_for_kernel() {
 
     # 安装对应的内核头文件
     info "安装 linux-headers-${kernel_ver}..."
-    if ! run_logged "安装 linux-headers-${kernel_ver}" apt-get install -y -qq "linux-headers-${kernel_ver}"; then
+    if ! run_logged "安装 linux-headers-${kernel_ver}" with_dkms_autoinstall_disabled apt-get install -y -qq "linux-headers-${kernel_ver}"; then
         local header_zfs_ver
         header_zfs_ver=$(get_zfs_dkms_version || true)
         if [[ -n "$header_zfs_ver" ]]; then

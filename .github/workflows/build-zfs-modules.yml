@@ -154,6 +154,7 @@ jobs:
                 add_target() {
                   local kernel="$1"
                   local package_file="zfs-modules-${kernel}.tar.gz"
+                  local runner
 
                   if [[ -n "${SKIP_PACKAGES_FILE}" && -f "${SKIP_PACKAGES_FILE}" ]] \
                     && grep -Fxq -- "${package_file}" "${SKIP_PACKAGES_FILE}"; then
@@ -161,8 +162,14 @@ jobs:
                     return 0
                   fi
 
-                  printf "{\"arch\":\"%s\",\"kernel\":\"%s\",\"artifact\":\"zfs-modules-%s\"}\n" \
-                    "${arch}" "${kernel}" "${kernel}"
+                  case "${arch}" in
+                    amd64) runner="ubuntu-24.04" ;;
+                    arm64) runner="ubuntu-24.04-arm" ;;
+                    *) echo "Unsupported architecture: ${arch}" >&2; return 1 ;;
+                  esac
+
+                  printf "{\"arch\":\"%s\",\"kernel\":\"%s\",\"artifact\":\"zfs-modules-%s\",\"runner\":\"%s\"}\n" \
+                    "${arch}" "${kernel}" "${kernel}" "${runner}"
                 }
 
                 if [[ "${KERNELS}" == "all" ]]; then
@@ -211,7 +218,7 @@ jobs:
     name: Build ${{ matrix.kernel }}
     needs: plan
     if: ${{ needs.plan.outputs.target_count != '0' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 330
     strategy:
       fail-fast: false
@@ -220,12 +227,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Set up QEMU for arm64 containers
-        if: ${{ matrix.arch == 'arm64' }}
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm64
 
       - name: Build package in Debian container
         env:
@@ -238,6 +239,7 @@ jobs:
           mkdir -p output
           echo "Workflow SHA: ${GITHUB_SHA}"
           echo "Checked out commit: $(git rev-parse --short HEAD)"
+          echo "Runner machine: $(uname -m)"
           echo "Target architecture: ${TARGET_ARCH}"
           echo "Target kernel: ${TARGET_KERNEL}"
 
