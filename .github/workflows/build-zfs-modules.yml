@@ -42,11 +42,13 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build on Debian ${{ inputs.debian_image }}
+  plan:
+    name: Plan build targets
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
+    timeout-minutes: 60
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      target_count: ${{ steps.plan.outputs.target_count }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -57,7 +59,6 @@ jobs:
           platforms: arm64
 
       - name: Read existing Release assets
-        id: release-assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
@@ -76,11 +77,10 @@ jobs:
           fi
 
           existing_count=$(wc -l < .github-tmp/release-assets.txt | tr -d " ")
-          echo "existing_asset_count=${existing_count}" >> "${GITHUB_OUTPUT}"
           echo "Found ${existing_count} existing Release assets."
 
-      - name: Build packages in Debian container
-        id: build
+      - name: Generate build matrix
+        id: plan
         env:
           DEBIAN_IMAGE: debian:${{ inputs.debian_image }}
           KERNELS: ${{ inputs.kernels }}
@@ -89,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p output .github-tmp
+          mkdir -p .github-tmp
           echo "Workflow SHA: ${GITHUB_SHA}"
           echo "Checked out commit: $(git rev-parse --short HEAD)"
 
@@ -100,6 +100,7 @@ jobs:
           fi
 
           normalized_arches=$(printf "%s" "${ARCHITECTURES}" | tr "," " ")
+          : > .github-tmp/targets.jsonl
 
           for arch in ${normalized_arches}; do
             case "${arch}" in
@@ -115,7 +116,6 @@ jobs:
               --platform "linux/${arch}" \
               -e DEBIAN_FRONTEND=noninteractive \
               -e KERNELS="${KERNELS}" \
-              -e GITHUB_RUN_ID="${GITHUB_RUN_ID}" \
               -e SKIP_PACKAGES_FILE=/workspace/.github-tmp/skip-assets.txt \
               -v "${GITHUB_WORKSPACE}:/workspace" \
               -w /workspace \
@@ -123,49 +123,185 @@ jobs:
               bash -lc '
                 set -euo pipefail
 
+                apt-get update -qq >/dev/null
+
+                source /etc/os-release
+                arch=$(dpkg --print-architecture)
+
+                supported_kernel() {
+                  local kver="$1"
+                  local stem tail
+
+                  case "$arch" in
+                    amd64|arm64)
+                      if [[ "$kver" == *"-cloud-${arch}" ]]; then
+                        return 0
+                      fi
+                      [[ "$kver" == *"-${arch}" ]] || return 1
+                      stem="${kver%-${arch}}"
+                      if [[ "$stem" != *"-"* ]]; then
+                        return 0
+                      fi
+                      tail="${stem##*-}"
+                      [[ "$tail" =~ ^[0-9]+$ ]]
+                      ;;
+                    *)
+                      return 1
+                      ;;
+                  esac
+                }
+
+                add_target() {
+                  local kernel="$1"
+                  local package_file="zfs-modules-${kernel}.tar.gz"
+
+                  if [[ -n "${SKIP_PACKAGES_FILE}" && -f "${SKIP_PACKAGES_FILE}" ]] \
+                    && grep -Fxq -- "${package_file}" "${SKIP_PACKAGES_FILE}"; then
+                    echo "Skip existing Release asset: ${package_file}" >&2
+                    return 0
+                  fi
+
+                  printf "{\"arch\":\"%s\",\"kernel\":\"%s\",\"artifact\":\"zfs-modules-%s\"}\n" \
+                    "${arch}" "${kernel}" "${kernel}"
+                }
+
                 if [[ "${KERNELS}" == "all" ]]; then
-                  bash zfs-builder.sh --ci --all
+                  while IFS= read -r kernel; do
+                    [[ -z "${kernel}" ]] && continue
+                    supported_kernel "${kernel}" || continue
+                    add_target "${kernel}"
+                  done < <(
+                    apt-cache search --names-only "^linux-headers-[0-9]" 2>/dev/null \
+                      | awk "{print \$1}" \
+                      | sed "s/^linux-headers-//" \
+                      | grep -Ev "(^|-)common($|-)|-dbg$|-dbgsym$|-all(-|$)" \
+                      | sort -V
+                  )
                 else
-                  args=(--ci)
                   normalized=$(printf "%s" "${KERNELS}" | tr "," " ")
                   for kernel in ${normalized}; do
-                    args+=(--kernel "${kernel}")
+                    supported_kernel "${kernel}" || {
+                      echo "Skip ${kernel}: not a target for ${arch}" >&2
+                      continue
+                    }
+                    add_target "${kernel}"
                   done
-                  bash zfs-builder.sh "${args[@]}"
                 fi
-              '
+              ' >> .github-tmp/targets.jsonl
           done
 
-          built_count=$(find output -maxdepth 1 -type f -name "zfs-modules-*.tar.gz" | wc -l | tr -d " ")
-          echo "built_count=${built_count}" >> "${GITHUB_OUTPUT}"
-          echo "Built ${built_count} new package(s)."
+          sort -u .github-tmp/targets.jsonl -o .github-tmp/targets.jsonl
 
-      - name: Upload workflow artifact
-        if: ${{ steps.build.outputs.built_count != '0' }}
+          target_count=$(wc -l < .github-tmp/targets.jsonl | tr -d " ")
+          echo "Planned ${target_count} build target(s)."
+          cat .github-tmp/targets.jsonl
+
+          if [[ "${target_count}" == "0" ]]; then
+            matrix='{"include":[]}'
+          else
+            matrix=$(jq -sc '{include:.}' .github-tmp/targets.jsonl)
+          fi
+
+          {
+            echo "target_count=${target_count}"
+            echo "matrix=${matrix}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build ${{ matrix.kernel }}
+    needs: plan
+    if: ${{ needs.plan.outputs.target_count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU for arm64 containers
+        if: ${{ matrix.arch == 'arm64' }}
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Build package in Debian container
+        env:
+          DEBIAN_IMAGE: debian:${{ inputs.debian_image }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          TARGET_KERNEL: ${{ matrix.kernel }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p output
+          echo "Workflow SHA: ${GITHUB_SHA}"
+          echo "Checked out commit: $(git rev-parse --short HEAD)"
+          echo "Target architecture: ${TARGET_ARCH}"
+          echo "Target kernel: ${TARGET_KERNEL}"
+
+          docker pull --platform "linux/${TARGET_ARCH}" "${DEBIAN_IMAGE}"
+          docker run --rm \
+            --platform "linux/${TARGET_ARCH}" \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${DEBIAN_IMAGE}" \
+            bash zfs-builder.sh --ci --kernel "${TARGET_KERNEL}"
+
+      - name: Upload package artifact
         uses: actions/upload-artifact@v7
         with:
-          name: zfs-modules-${{ inputs.debian_image }}
-          path: |
-            output/*.tar.gz
+          name: ${{ matrix.artifact }}
+          path: output/${{ matrix.artifact }}.tar.gz
           if-no-files-found: error
           retention-days: 14
 
-      - name: Report no new packages
-        if: ${{ steps.build.outputs.built_count == '0' }}
-        run: echo "No new packages were built; all selected targets already exist in the Release or local output."
+  publish:
+    name: Publish Release assets
+    needs:
+      - plan
+      - build
+    if: ${{ always() && inputs.publish_release && needs.plan.outputs.target_count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Download built packages
+        uses: actions/download-artifact@v7
+        continue-on-error: true
+        with:
+          pattern: zfs-modules-*
+          path: output
+          merge-multiple: true
 
       - name: Publish GitHub Release assets
-        if: ${{ inputs.publish_release && steps.build.outputs.built_count != '0' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
 
+          shopt -s nullglob
+          packages=(output/*.tar.gz)
+
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "No built packages were downloaded; nothing to publish."
+            exit 0
+          fi
+
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" output/*.tar.gz --clobber
+            gh release upload "${RELEASE_TAG}" "${packages[@]}" --clobber
           else
-            gh release create "${RELEASE_TAG}" output/*.tar.gz \
+            gh release create "${RELEASE_TAG}" "${packages[@]}" \
               --title "${RELEASE_TAG}" \
               --notes "ZFS prebuilt modules built by GitHub Actions run ${GITHUB_RUN_ID}."
           fi
+
+  no-targets:
+    name: Report no new packages
+    needs: plan
+    if: ${{ needs.plan.outputs.target_count == '0' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No new packages were planned; all selected targets already exist in the Release."

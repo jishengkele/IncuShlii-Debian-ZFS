@@ -58,6 +58,10 @@ APT 源启用 `contrib` 组件。
 上传到 `release_tag` 指定的 GitHub Release。默认 tag 是 `Debian-ZFS`，与当前
 仓库已有 Release 保持一致。
 
+workflow 会先生成待构建列表，然后按单个内核版本拆分成矩阵任务并行构建。这样某个
+架构或内核版本耗时较长时，已经完成的产物会先作为 artifact 保存，最后再统一发布到
+Release。
+
 如果所有目标产物都已经存在，workflow 会正常结束，不会上传新的 artifact，也不会
 重复发布 Release asset。
 
