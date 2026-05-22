@@ -44,7 +44,7 @@ divider() {
 
 get_zfs_dkms_version() {
     dkms status 2>/dev/null \
-        | awk -F'[/, ]+' '$1 == "zfs" { for (i = 2; i <= NF; i++) if ($i ~ /^[0-9][0-9A-Za-z.+:~_-]*$/) { print $i; exit } }' \
+        | awk -F'[/, ]+' '$1 == "zfs" { for (i = 2; i <= NF; i++) if ($i ~ /^[0-9][0-9A-Za-z.+:~_-]*:?$/) { sub(/:$/, "", $i); print $i; exit } }' \
         | head -n1
 }
 
